@@ -1,142 +1,141 @@
 package org.itmo;
 
-import org.jetbrains.annotations.NotNull;
-
-import java.util.*;
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 
 class Graph {
     private final int V;
-    private AtomicInteger counter;
-    private final ArrayList<Integer>[] adjList;
+    private int E = 0;
+    private final List<List<Integer>> adjList;
+    private final AtomicInteger counter = new AtomicInteger(0);
 
-    @SuppressWarnings("unchecked")
+
     Graph(int vertices) {
         this.V = vertices;
-        this.counter = new AtomicInteger(0);
-        adjList = new ArrayList[vertices];
+        this.adjList = new ArrayList<>(vertices);
         for (int i = 0; i < vertices; ++i) {
-            adjList[i] = new ArrayList<>();
+            adjList.add(new ArrayList<>());
         }
     }
 
     void addEdge(int src, int dest) {
-        if (!adjList[src].contains(dest)) {
-            adjList[src].add(dest);
+        if (!adjList.get(src).contains(dest)) {
+            adjList.get(src).add(dest);
+            E++;
         }
     }
 
-    public AtomicInteger getCounter() {
-        return counter;
-    }
+    void bfs(int startVertex) {
+        boolean[] visited = new boolean[V];
+        LinkedList<Integer> queue = new LinkedList<>();
 
-    public void cleanCounter() {
-        counter = new AtomicInteger(0);
-    }
+        visited[startVertex] = true;
+        counter.incrementAndGet();
+        queue.add(startVertex);
 
-    void scanLevel(
-            int vertex,
-            int threadsAvailable,
-            AtomicIntegerArray visited,
-            ExecutorService executor,
-            ConcurrentLinkedQueue<Integer> nextQueue
-    ) {
-        List<Integer> neighbors = adjList[vertex];
+        while (!queue.isEmpty()) {
+            int v = queue.poll();
 
-        if (neighbors.size() < threadsAvailable * 10) {
-            for (int n : neighbors) {
-                if (visited.compareAndSet(n, 0, 1)) {
+            for (int n : adjList.get(v)) {
+                if (!visited[n]) {
+                    visited[n] = true;
                     counter.incrementAndGet();
-                    nextQueue.add(n);
+                    queue.add(n);
                 }
-            }
-        }
-        else {
-            int chunkSize = neighbors.size() / threadsAvailable + 1;
-            CountDownLatch latch = new CountDownLatch(threadsAvailable);
-            List<Integer>[] localResultQueues = new LinkedList[threadsAvailable];
-            Arrays.setAll(localResultQueues, i -> new LinkedList<Integer>());
-
-            for (int t = 0; t < threadsAvailable; t++) {
-                int start = t * chunkSize;
-                int end = Math.min(neighbors.size(), (t + 1) * chunkSize);
-                int finalT = t;
-
-                executor.execute(() -> {
-                    try {
-                        for (int i = start; i < end; i++) {
-                            int n = neighbors.get(i);
-                            if (visited.compareAndSet(n, 0, 1)) {
-                                counter.incrementAndGet();
-                                localResultQueues[finalT].add(n);
-                            }
-                        }
-                    } finally {
-                        latch.countDown();
-                    }
-                });
-            }
-
-            try {
-                latch.await();
-                for (List<Integer> localResultQueue : localResultQueues) {
-                    nextQueue.addAll(localResultQueue);
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
             }
         }
     }
 
     void parallelBFS(int startVertex) {
-        parallelBFS(startVertex, Math.min(Runtime.getRuntime().availableProcessors(), 4));
+        int threadsAvailable = Math.min(Runtime.getRuntime().availableProcessors(), 4);
+        if (V < 1000 || E < V * 5) {
+            bfs(startVertex);
+            return;
+        }
+
+        parallelBFS(startVertex, threadsAvailable);
     }
 
-    void parallelBFS(int startVertex, int threadsAvailable) {
+    void parallelBFS(int startVertex, int numberOfThreads) {
         AtomicIntegerArray visited = new AtomicIntegerArray(V);
-        ConcurrentLinkedQueue<Integer> levelsQueue = new ConcurrentLinkedQueue<Integer>();
-        ExecutorService executor = Executors.newFixedThreadPool(threadsAvailable);
 
-        levelsQueue.add(startVertex);
-
-        try {
-            while ( ! levelsQueue.isEmpty()) {
-                ConcurrentLinkedQueue<Integer> nextQueue = new ConcurrentLinkedQueue<Integer>();
-                Integer actualVertex;
-                while ((actualVertex = levelsQueue.poll()) != null) {
-                    this.scanLevel(actualVertex, threadsAvailable, visited, executor, nextQueue);
-                }
-                levelsQueue = nextQueue;
-            }
+        if (!visited.compareAndSet(startVertex, 0, 1)) {
+            return;
         }
-        finally {
-            executor.shutdown();
-        }
-    }
-
-    //Generated by ChatGPT
-    void bfs(int startVertex) {
-        boolean[] visited = new boolean[V];
-
-        LinkedList<Integer> queue = new LinkedList<>();
-
-        visited[startVertex] = true;
-        queue.add(startVertex);
         counter.incrementAndGet();
 
-        while (!queue.isEmpty()) {
-            startVertex = queue.poll();
+        ConcurrentLinkedQueue<Integer> currentLevel = new ConcurrentLinkedQueue<>();
+        currentLevel.add(startVertex);
 
-            for (int n : adjList[startVertex]) {
-                if (!visited[n]) {
-                    visited[n] = true;
-                    queue.add(n);
-                    counter.incrementAndGet();
+        ExecutorService executor = Executors.newFixedThreadPool(numberOfThreads);
+        try {
+            while (!currentLevel.isEmpty()) {
+
+                List<List<Integer>> localQueues = new ArrayList<>(numberOfThreads);
+                for (int i = 0; i < numberOfThreads; ++i) {
+                    localQueues.add(new LinkedList<>());
                 }
+
+                CountDownLatch latch = new CountDownLatch(numberOfThreads);
+                for (int t = 0; t < numberOfThreads; ++t) {
+                    final int idx = t;
+                    ConcurrentLinkedQueue<Integer> finalCurrentLevel = currentLevel;
+                    executor.execute(() -> {
+                        try {
+                            Integer v;
+                            while ((v = finalCurrentLevel.poll()) != null) {
+                                processVertex(v, visited, localQueues.get(idx));
+                            }
+                        } finally {
+                            latch.countDown();
+                        }
+                    });
+                }
+
+                latch.await();
+                ConcurrentLinkedQueue<Integer> nextLevel = new ConcurrentLinkedQueue<>();
+                for (List<Integer> lq : localQueues) {
+                    nextLevel.addAll(lq);
+                }
+                currentLevel = nextLevel;
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            executor.shutdownNow();
+            try {
+                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
             }
         }
     }
 
+    private void processVertex(
+        int v,
+       AtomicIntegerArray visited,
+       List<Integer> localQueue
+    ) {
+        for (int n : adjList.get(v)) {
+            if (visited.compareAndSet(n, 0, 1)) {
+                counter.incrementAndGet();
+                localQueue.add(n);
+            }
+        }
+    }
+
+    int getVisitedCounterValue() {
+        return counter.get();
+    }
+
+    int getNumberOfVertices() {
+        return V;
+    }
 }
